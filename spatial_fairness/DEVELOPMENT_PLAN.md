@@ -90,23 +90,34 @@ Where:
 **Arrival Service Rate (ASR)** - measures dropoff frequency per cell:
 
 $$
-ASR_i^p = \frac{D_i^p}{N^p \cdot T^p}
+ASR_i^p = \frac{D_i^p}{N_i^p \cdot T^p}
 $$
 
 **Departure Service Rate (DSR)** - measures pickup frequency per cell:
 
 $$
-DSR_i^p = \frac{O_i^p}{N^p \cdot T^p}
+DSR_i^p = \frac{O_i^p}{N_i^p \cdot T^p}
 $$
 
 | Symbol | Definition | Source |
 |--------|------------|--------|
 | $D_i^p$ | Number of dropoffs in cell $i$ during period $p$ | `pickup_dropoff_counts.pkl` (index 1) |
 | $O_i^p$ | Number of pickups in cell $i$ during period $p$ | `pickup_dropoff_counts.pkl` (index 0) |
-| $N^p$ | Number of active taxis during period $p$ | Configuration (default: 50) |
+| $N_i^p$ | Number of active taxis for cell $i$ during period $p$ | See below |
 | $T^p$ | Duration of period $p$ in days | Computed from period definition |
-| $i$ | Grid cell index | $(x, y) \in [0,47] \times [0,89]$ |
+| $i$ | Grid cell index | $(x, y) \in [1,48] \times [1,90]$ (1-indexed) |
 | $p$ | Time period | Depends on period definition |
+
+**Options for $N_i^p$**:
+
+1. **Constant**: $N_i^p = N$ for all cells and periods (e.g., N=50)
+   - Simple, original approach
+   - Configuration: `taxi_count_source="constant"`, `num_taxis=50`
+
+2. **Active Taxis Lookup**: $N_i^p$ = count of unique taxis in n×n neighborhood of cell $i$ during period $p$
+   - More accurate per-cell normalization
+   - Requires pre-computed `active_taxis_*.pkl` data
+   - Configuration: `taxi_count_source="active_taxis_lookup"`, `active_taxis_data_path="..."`
 
 #### 2.2.2 Gini Coefficient
 
@@ -653,46 +664,136 @@ For FAMAIL data: $K \approx 234,000$, $|P| \leq 1728$ (288 × 6), $|G| = 4320$ (
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `grid_dims` | Tuple[int, int] | Spatial grid dimensions (default: (48, 90)) |
-| `num_taxis` | int | Number of active taxis (default: 50) |
 
-### 6.2 Optional Parameters
+### 6.2 Taxi Count Configuration (N^p)
+
+The service rate formula $DSR_i^p = \frac{O_i^p}{N_i^p \cdot T^p}$ requires specifying $N^p$, the number of active taxis. Two approaches are supported:
+
+#### 6.2.1 Constant Taxi Count (Original Approach)
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `period_type` | str | "time_bucket" | Temporal aggregation granularity |
+| `taxi_count_source` | str | "constant" | Set to "constant" for fixed value |
+| `num_taxis` | int | 50 | Number of active taxis used for all cells |
+
+```python
+# Example: Using constant taxi count
+config = SpatialFairnessConfig(
+    taxi_count_source="constant",
+    num_taxis=50,  # Same N^p for all cells
+)
+```
+
+#### 6.2.2 Active Taxis Lookup (Dynamic Per-Cell)
+
+Uses pre-computed active taxi counts from the `active_taxis` tool, which counts unique taxis present in each n×n neighborhood during each time period.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `taxi_count_source` | str | "constant" | Set to "active_taxis_lookup" for dynamic lookup |
+| `active_taxis_data_path` | str | None | Path to `active_taxis_*.pkl` file |
+| `active_taxis_neighborhood` | int | 2 | Neighborhood k value (2 = 5×5 neighborhood) |
+| `active_taxis_fallback` | int | 1 | Value when lookup returns 0 (avoid div by zero) |
+
+```python
+# Example: Using active_taxis lookup
+config = SpatialFairnessConfig(
+    taxi_count_source="active_taxis_lookup",
+    active_taxis_data_path="source_data/active_taxis_5x5_hourly.pkl",
+    active_taxis_neighborhood=2,  # 5×5 neighborhood
+    active_taxis_fallback=1,  # Use 1 if no taxis found
+    period_type="hourly",  # Must match active_taxis file period type
+)
+```
+
+**Key Considerations**:
+- The `period_type` must match the active_taxis dataset's period type
+- Active taxis files: `active_taxis_5x5_hourly.pkl`, `active_taxis_5x5_daily.pkl`, etc.
+- Use `active_taxis_fallback` to avoid division by zero for cells with no taxi presence
+
+#### 6.2.3 A/B Testing Capability
+
+The dual approach enables A/B testing to compare fairness metrics:
+
+```python
+# Test A: Constant taxi count (original)
+config_a = SpatialFairnessConfig(
+    taxi_count_source="constant",
+    num_taxis=50,
+    period_type="hourly",
+)
+
+# Test B: Dynamic active_taxis lookup
+config_b = SpatialFairnessConfig(
+    taxi_count_source="active_taxis_lookup",
+    active_taxis_data_path="source_data/active_taxis_5x5_hourly.pkl",
+    period_type="hourly",
+)
+
+# Compare results
+term_a = SpatialFairnessTerm(config_a)
+term_b = SpatialFairnessTerm(config_b)
+
+result_a = term_a.compute({}, auxiliary_data)
+result_b = term_b.compute({}, auxiliary_data)
+```
+
+### 6.3 Temporal Coverage Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
 | `num_days` | float | 21.0 | Number of days in dataset |
+
+**Dataset temporal coverage (weekdays only)**:
+- July 2016: 21 weekdays → `num_days=21.0`
+- August 2016: 23 weekdays → `num_days=23.0`
+- September 2016: 22 weekdays → `num_days=22.0`
+- All months combined: 66 weekdays → `num_days=66.0`
+
+### 6.4 Other Optional Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `period_type` | str | "hourly" | Temporal aggregation granularity |
 | `include_zero_cells` | bool | True | Include cells with zero activity |
-| `weight` | float | 1.0 | Weight in objective function ($\alpha_2$) |
-| `cache_intermediate` | bool | True | Cache Gini coefficients |
+| `data_is_one_indexed` | bool | True | Whether data uses 1-based indexing |
+| `min_activity_threshold` | int | 0 | Minimum events to include cell |
+| `days_filter` | List[int] | None | Filter to specific days (1-6) |
+| `time_filter` | Tuple[int,int] | None | Filter to time bucket range |
 | `verbose` | bool | False | Print debug information |
 
-### 6.3 Default Values and Rationale
+### 6.5 Default Values and Rationale
 
 ```python
 DEFAULT_CONFIG = SpatialFairnessConfig(
     # Spatial dimensions
     grid_dims=(48, 90),       # Matches Shenzhen grid (0.01° resolution)
     
-    # Fleet parameters
+    # Taxi count configuration
+    taxi_count_source="constant",  # Original approach (for backward compatibility)
     num_taxis=50,             # 50 expert drivers in dataset
+    active_taxis_data_path=None,
+    active_taxis_neighborhood=2,  # 5×5 neighborhood
+    active_taxis_fallback=1,  # Avoid division by zero
+    
+    # Temporal coverage
     num_days=21.0,            # July 2016 weekdays (excludes Sundays)
     
     # Temporal aggregation
-    period_type="time_bucket", # Finest granularity (288 periods/day)
+    period_type="hourly",     # Good balance of granularity and performance
     
     # Computation options
     include_zero_cells=True,   # Include inactive cells for complete picture
-    weight=1.0,                # Equal weight (adjusted during integration)
-    cache_intermediate=True,   # Improve performance for repeated calls
     verbose=False,
 )
 ```
 
 **Rationale for Defaults**:
 
-- `period_type="time_bucket"`: Captures temporal variation in inequality
+- `taxi_count_source="constant"`: Backward compatible with original implementation
+- `period_type="hourly"`: Good balance of temporal detail and computation time
 - `include_zero_cells=True`: Zero-activity cells contribute to inequality measure
-- `num_days=21.0`: July 2016 has 21 non-Sunday days in the dataset
+- `num_days=21.0`: July 2016 has 21 weekdays in the dataset
 
 ---
 

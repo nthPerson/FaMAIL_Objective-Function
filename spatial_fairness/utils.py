@@ -290,30 +290,39 @@ def compute_service_rates_for_period(
     include_zero_cells: bool = True,
     data_is_one_indexed: bool = True,
     min_activity_threshold: int = 0,
+    active_taxis_data: Optional[Dict[Tuple, int]] = None,
+    active_taxis_fallback: int = 1,
+    period_type: str = "hourly",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute Departure Service Rate (DSR) and Arrival Service Rate (ASR)
     for all cells in a given period.
     
-    DSR = pickups / (num_taxis * period_duration)
-    ASR = dropoffs / (num_taxis * period_duration)
+    DSR = pickups / (N^p * period_duration)
+    ASR = dropoffs / (N^p * period_duration)
+    
+    Where N^p is either:
+        - num_taxis (constant) if active_taxis_data is None
+        - active_taxi_count for each cell if active_taxis_data is provided
     
     Args:
         pickups: Aggregated pickup counts {((x, y), period): count}
         dropoffs: Aggregated dropoff counts
         period: The period to compute rates for
         grid_dims: Grid dimensions (x_cells, y_cells)
-        num_taxis: Number of active taxis
+        num_taxis: Number of active taxis (used when active_taxis_data is None)
         period_duration_days: Duration of period in days
         include_zero_cells: Whether to include cells with zero activity
         data_is_one_indexed: Whether data uses 1-based indexing
         min_activity_threshold: Minimum total activity to include cell
+        active_taxis_data: Pre-computed active taxi counts (optional)
+        active_taxis_fallback: Value when active_taxi lookup returns 0
+        period_type: Period type for active_taxis lookup
         
     Returns:
         Tuple of (dsr_values, asr_values) as numpy arrays
     """
     x_dim, y_dim = grid_dims
-    normalization = num_taxis * period_duration_days
     
     dsr_list = []
     asr_list = []
@@ -340,6 +349,18 @@ def compute_service_rates_for_period(
             
             if total_activity < min_activity_threshold:
                 continue
+            
+            # Determine N^p (number of active taxis)
+            if active_taxis_data is not None:
+                # Use cell-specific active taxi count
+                n_taxis = get_active_taxi_count(
+                    active_taxis_data, x, y, period, period_type, active_taxis_fallback
+                )
+            else:
+                # Use constant num_taxis
+                n_taxis = num_taxis
+            
+            normalization = n_taxis * period_duration_days
             
             dsr = pickup_count / normalization if normalization > 0 else 0
             asr = dropoff_count / normalization if normalization > 0 else 0
@@ -464,3 +485,256 @@ def get_data_statistics(
             'unique_days': len(set(day_vals)),
         },
     }
+
+
+# =============================================================================
+# ACTIVE TAXIS DATA FUNCTIONS
+# =============================================================================
+
+def load_active_taxis_data(filepath: str) -> Dict[Tuple, int]:
+    """
+    Load pre-computed active taxi counts from pickle file.
+    
+    The active_taxis data contains counts of unique taxis present in each
+    n×n neighborhood during each time period.
+    
+    Key formats depend on period_type used during generation:
+        - hourly: (x, y, hour, day) -> count
+        - daily: (x, y, day) -> count
+        - time_bucket: (x, y, time_bin, day) -> count
+        - all: (x, y, 'all') -> count
+    
+    Args:
+        filepath: Path to active_taxis_*.pkl file
+        
+    Returns:
+        Dictionary mapping (x, y, *period_key) -> active_taxi_count
+        
+    Raises:
+        FileNotFoundError: If file doesn't exist
+        ValueError: If file is empty or invalid
+    """
+    import pickle
+    from pathlib import Path
+    
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"Active taxis file not found: {filepath}")
+    
+    with open(path, 'rb') as f:
+        data = pickle.load(f)
+    
+    if not isinstance(data, dict) or len(data) == 0:
+        raise ValueError(f"Invalid active_taxis data: expected non-empty dict, got {type(data)}")
+    
+    # Handle nested structure: extract 'data' if present
+    if 'data' in data and isinstance(data['data'], dict):
+        # This is the new format with 'data', 'stats', 'config' keys
+        # Return just the data mapping
+        return data['data']
+    
+    # Otherwise assume it's already in the correct format
+    return data
+
+
+def get_active_taxi_count(
+    active_taxis_data: Dict[Tuple, int],
+    x: int,
+    y: int,
+    period: Any,
+    period_type: str,
+    fallback: int = 1,
+) -> int:
+    """
+    Look up the number of active taxis for a specific cell and period.
+    
+    Args:
+        active_taxis_data: Loaded active_taxis data
+        x: Grid cell x coordinate (1-indexed)
+        y: Grid cell y coordinate (1-indexed)
+        period: Period identifier (varies by period_type)
+            - hourly: (hour, day) tuple
+            - daily: day integer
+            - time_bucket: (time_bin, day) tuple
+            - all: "all" string
+        period_type: Type of period aggregation
+        fallback: Value to return if lookup fails or returns 0
+        
+    Returns:
+        Number of active taxis, or fallback if not found or zero
+    """
+    # Build the lookup key based on period_type
+    if period_type == "hourly":
+        # period is (hour, day), key is (x, y, hour, day)
+        hour, day = period
+        key = (x, y, hour, day)
+    elif period_type == "daily":
+        # period is day, key is (x, y, day)
+        key = (x, y, period)
+    elif period_type == "time_bucket":
+        # period is (time_bin, day), key is (x, y, time_bin, day)
+        time_bin, day = period
+        key = (x, y, time_bin, day)
+    elif period_type == "all":
+        # period is "all", key is (x, y, 'all')
+        key = (x, y, 'all')
+    else:
+        return fallback
+    
+    # Look up the count
+    count = active_taxis_data.get(key, 0)
+    
+    # Return fallback if count is 0 to avoid division by zero
+    return count if count > 0 else fallback
+
+
+def get_active_taxi_count_for_cell(
+    active_taxis_data: Dict[Tuple, int],
+    cell: Tuple[int, int],
+    period: Any,
+    period_type: str,
+    fallback: int = 1,
+) -> int:
+    """
+    Convenience function to look up active taxi count for a cell.
+    
+    Args:
+        active_taxis_data: Loaded active_taxis data
+        cell: (x, y) grid cell coordinates
+        period: Period identifier
+        period_type: Type of period aggregation
+        fallback: Value to return if lookup fails
+        
+    Returns:
+        Number of active taxis
+    """
+    x, y = cell
+    return get_active_taxi_count(active_taxis_data, x, y, period, period_type, fallback)
+
+
+def get_active_taxis_statistics(
+    active_taxis_data: Dict[Tuple, int]
+) -> Dict[str, Any]:
+    """
+    Compute statistics about the active_taxis data.
+    
+    Args:
+        active_taxis_data: Loaded active_taxis data (can be nested dict with 'data', 'stats', 'config')
+        
+    Returns:
+        Dictionary of statistics
+    """
+    # Handle nested structure from pickle files
+    if isinstance(active_taxis_data, dict) and 'data' in active_taxis_data:
+        # Extract the actual data mapping
+        data = active_taxis_data['data']
+        # Return pre-computed stats if available
+        if 'stats' in active_taxis_data:
+            stats = active_taxis_data['stats']
+            return {
+                'total_keys': stats.get('total_output_keys', 0),
+                'period_type_guess': 'from_config',
+                'count_stats': {
+                    'mean': stats.get('avg_active_taxis_per_cell', 0.0),
+                    'std': 0.0,
+                    'min': 0,
+                    'max': stats.get('max_active_taxis_in_cell', 0),
+                    'median': 0.0,
+                    'zero_count': 0,
+                    'nonzero_count': stats.get('total_output_keys', 0),
+                },
+                'spatial': {
+                    'x_range': (0, 0),
+                    'y_range': (0, 0),
+                    'unique_cells': stats.get('unique_cells', 0),
+                },
+            }
+    else:
+        data = active_taxis_data
+    
+    if len(data) == 0:
+        return {'error': 'Empty data'}
+    
+    counts = list(data.values())
+    keys = list(data.keys())
+    
+    # Determine period_type from key structure
+    sample_key = keys[0]
+    if len(sample_key) == 4:
+        # (x, y, time_component, day) - hourly or time_bucket
+        period_type_guess = "hourly_or_time_bucket"
+    elif len(sample_key) == 3:
+        if sample_key[2] == 'all':
+            period_type_guess = "all"
+        else:
+            period_type_guess = "daily"
+    else:
+        period_type_guess = "unknown"
+    
+    return {
+        'total_keys': len(active_taxis_data),
+        'period_type_guess': period_type_guess,
+        'count_stats': {
+            'mean': np.mean(counts),
+            'std': np.std(counts),
+            'min': min(counts),
+            'max': max(counts),
+            'median': np.median(counts),
+            'zero_count': sum(1 for c in counts if c == 0),
+            'nonzero_count': sum(1 for c in counts if c > 0),
+        },
+        'spatial': {
+            'x_range': (min(k[0] for k in keys), max(k[0] for k in keys)),
+            'y_range': (min(k[1] for k in keys), max(k[1] for k in keys)),
+            'unique_cells': len(set((k[0], k[1]) for k in keys)),
+        },
+    }
+
+
+def validate_active_taxis_period_alignment(
+    active_taxis_data: Dict[Tuple, int],
+    config_period_type: str,
+) -> Tuple[bool, str]:
+    """
+    Validate that active_taxis data period type matches config period type.
+    
+    Args:
+        active_taxis_data: Loaded active_taxis data
+        config_period_type: Period type from SpatialFairnessConfig
+        
+    Returns:
+        Tuple of (is_aligned, message)
+    """
+    if len(active_taxis_data) == 0:
+        return False, "Active taxis data is empty"
+    
+    sample_key = list(active_taxis_data.keys())[0]
+    key_len = len(sample_key)
+    
+    # Determine expected key length for each period_type
+    expected_lengths = {
+        "hourly": 4,       # (x, y, hour, day)
+        "time_bucket": 4,  # (x, y, time_bin, day)
+        "daily": 3,        # (x, y, day)
+        "all": 3,          # (x, y, 'all')
+    }
+    
+    expected_len = expected_lengths.get(config_period_type)
+    if expected_len is None:
+        return False, f"Unknown period_type: {config_period_type}"
+    
+    if key_len != expected_len:
+        return False, (
+            f"Period type mismatch: config expects {config_period_type} "
+            f"(key length {expected_len}), but data has key length {key_len}. "
+            f"Sample key: {sample_key}"
+        )
+    
+    # For 'all' period_type, verify the third element is 'all'
+    if config_period_type == "all" and sample_key[2] != 'all':
+        return False, (
+            f"Period type mismatch: config expects 'all' but data key third element "
+            f"is {sample_key[2]}, not 'all'"
+        )
+    
+    return True, "Period types are aligned"

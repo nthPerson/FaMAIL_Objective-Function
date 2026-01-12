@@ -33,7 +33,7 @@ OBJECTIVE_FUNCTION_DIR = SCRIPT_DIR.parent
 PROJECT_ROOT = OBJECTIVE_FUNCTION_DIR.parent
 sys.path.insert(0, str(OBJECTIVE_FUNCTION_DIR))
 
-from config import SpatialFairnessConfig
+from config import SpatialFairnessConfig, WEEKDAYS_JULY, WEEKDAYS_AUGUST, WEEKDAYS_SEPTEMBER, WEEKDAYS_TOTAL
 from term import SpatialFairnessTerm
 from utils import (
     compute_gini,
@@ -42,6 +42,8 @@ from utils import (
     get_unique_periods,
     get_data_statistics,
     validate_pickup_dropoff_data,
+    load_active_taxis_data,
+    get_active_taxis_statistics,
 )
 # from spatial_fairness.config import SpatialFairnessConfig
 # from spatial_fairness.term import SpatialFairnessTerm
@@ -320,31 +322,167 @@ def main():
         "Period Type",
         options=["hourly", "daily", "time_bucket", "all"],
         index=0,
-        help="Temporal aggregation granularity"
+        help=(
+            "Temporal aggregation granularity for computing Gini coefficients.\n\n"
+            "• **hourly**: Compute fairness for each hour (24 periods/day)\n"
+            "• **daily**: Compute fairness for each day\n"
+            "• **time_bucket**: 5-minute intervals (288 periods/day, finest)\n"
+            "• **all**: Single aggregate across all time"
+        )
     )
     
     include_zero_cells = st.sidebar.checkbox(
         "Include Zero Cells",
         value=False,
-        help="Include cells with no activity in Gini calculation"
+        help=(
+            "Whether to include grid cells with zero activity in Gini calculation.\n\n"
+            "• **Checked**: All 4,320 cells included (more conservative fairness estimate)\n"
+            "• **Unchecked**: Only active cells included (focuses on areas with service)"
+        )
     )
     
-    num_taxis = st.sidebar.number_input(
-        "Number of Taxis",
-        min_value=1,
-        max_value=1000,
-        value=50,
-        help="Number of active taxis in dataset"
+    # Taxi count configuration
+    st.sidebar.subheader("🚕 Taxi Count Configuration (N^p)")
+    
+    st.sidebar.markdown(
+        """
+        The service rate formula is: DSR = pickups / (N^p × T)
+        
+        N^p can be either:
+        - **Constant**: Same value for all cells (original approach)
+        - **Active Taxis Lookup**: Dynamic per-cell values from pre-computed dataset
+        """,
+        help="This affects how service rates are normalized across different neighborhoods"
     )
     
-    num_days = st.sidebar.number_input(
-        "Number of Days",
-        min_value=1.0,
-        max_value=365.0,
-        value=21.0,
-        step=1.0,
-        help="Number of days in dataset"
+    taxi_count_source = st.sidebar.radio(
+        "Taxi Count Source",
+        options=["constant", "active_taxis_lookup"],
+        index=0,
+        format_func=lambda x: "Constant" if x == "constant" else "Active Taxis Lookup",
+        help=(
+            "How to determine N^p (number of taxis) in service rate calculation.\n\n"
+            "• **Constant**: Use a fixed number for all cells (e.g., 50 taxis)\n"
+            "• **Active Taxis Lookup**: Use pre-computed counts of taxis in each neighborhood"
+        )
     )
+    
+    # Conditional inputs based on taxi_count_source
+    num_taxis = 50  # default
+    active_taxis_data = None
+    active_taxis_path = None
+    fallback = 1  # default fallback value
+    
+    if taxi_count_source == "constant":
+        num_taxis = st.sidebar.number_input(
+            "Number of Taxis (N^p)",
+            min_value=1,
+            max_value=1000,
+            value=50,
+            help=(
+                "Fixed number of taxis used to normalize service rates.\n\n"
+                "This value is used as N^p in DSR = pickups / (N^p × T) for all cells."
+            )
+        )
+    else:
+        # Active taxis lookup mode
+        default_active_path = PROJECT_ROOT / "source_data"
+        
+        # Try to find available active_taxis files
+        active_files = []
+        if default_active_path.exists():
+            active_files = list(default_active_path.glob("active_taxis_*.pkl"))
+        
+        if active_files:
+            # Map period_type to expected file suffix
+            period_file_map = {
+                "hourly": "hourly",
+                "daily": "daily", 
+                "time_bucket": "time_bucket",
+                "all": "all"
+            }
+            
+            # Find matching file for selected period_type
+            expected_suffix = period_file_map.get(period_type, "hourly")
+            matching_files = [f for f in active_files if expected_suffix in f.name]
+            
+            if matching_files:
+                default_idx = 0
+            else:
+                matching_files = active_files
+                default_idx = 0
+            
+            active_taxis_path = st.sidebar.selectbox(
+                "Active Taxis Dataset",
+                options=[str(f) for f in matching_files],
+                index=default_idx,
+                help=(
+                    f"Select the active_taxis dataset file.\n\n"
+                    f"⚠️ Ensure the period type matches: currently selected '{period_type}'"
+                )
+            )
+        else:
+            active_taxis_path = st.sidebar.text_input(
+                "Active Taxis Dataset Path",
+                value=str(PROJECT_ROOT / "../../source_data" / f"active_taxis_5x5_{period_type}.pkl"),
+                help="Path to the active_taxis_*.pkl file"
+            )
+        
+        # Load active_taxis data
+        if active_taxis_path and os.path.exists(active_taxis_path):
+            try:
+                active_taxis_data = load_active_taxis_data(active_taxis_path)
+                active_stats = get_active_taxis_statistics(active_taxis_data)
+                st.sidebar.success(f"✅ Loaded {len(active_taxis_data):,} active_taxis records")
+                st.sidebar.caption(
+                    f"Count range: {active_stats['count_stats']['min']}-{active_stats['count_stats']['max']}, "
+                    f"Mean: {active_stats['count_stats']['mean']:.1f}"
+                )
+            except Exception as e:
+                st.sidebar.error(f"Error loading active_taxis: {e}")
+                active_taxis_data = None
+        elif active_taxis_path:
+            st.sidebar.warning(f"⚠️ File not found: {active_taxis_path}")
+        
+        # Fallback value
+        fallback = st.sidebar.number_input(
+            "Fallback Value",
+            min_value=1,
+            max_value=100,
+            value=1,
+            help=(
+                "Value to use when active_taxis lookup returns 0.\n\n"
+                "This prevents division by zero in service rate calculation."
+            )
+        )
+    
+    # Temporal coverage
+    st.sidebar.subheader("📅 Temporal Coverage")
+    
+    num_days_option = st.sidebar.selectbox(
+        "Dataset Time Period",
+        options=["july", "august", "september", "all"],
+        index=0,
+        format_func=lambda x: {
+            "july": f"July 2016 ({WEEKDAYS_JULY} weekdays)",
+            "august": f"August 2016 ({WEEKDAYS_AUGUST} weekdays)",
+            "september": f"September 2016 ({WEEKDAYS_SEPTEMBER} weekdays)",
+            "all": f"All Months ({WEEKDAYS_TOTAL} weekdays)"
+        }[x],
+        help=(
+            "Select which month(s) of data you're analyzing.\n\n"
+            "This affects the num_days parameter used in temporal normalization."
+        )
+    )
+    
+    num_days = {
+        "july": float(WEEKDAYS_JULY),
+        "august": float(WEEKDAYS_AUGUST),
+        "september": float(WEEKDAYS_SEPTEMBER),
+        "all": float(WEEKDAYS_TOTAL)
+    }[num_days_option]
+    
+    st.sidebar.caption(f"Using num_days = {num_days}")
     
     # Day filter
     st.sidebar.subheader("Filters")
@@ -363,7 +501,10 @@ def main():
     config = SpatialFairnessConfig(
         period_type=period_type,
         grid_dims=(48, 90),
+        taxi_count_source=taxi_count_source,
         num_taxis=num_taxis,
+        active_taxis_data_path=active_taxis_path if taxi_count_source == "active_taxis_lookup" else None,
+        active_taxis_fallback=fallback if taxi_count_source == "active_taxis_lookup" else 1,
         num_days=num_days,
         include_zero_cells=include_zero_cells,
         days_filter=days_filter,
@@ -374,8 +515,12 @@ def main():
     term = SpatialFairnessTerm(config)
     
     # Compute results
+    auxiliary_data = {'pickup_dropoff_counts': data}
+    if active_taxis_data is not None:
+        auxiliary_data['active_taxis_counts'] = active_taxis_data
+    
     with st.spinner("Computing spatial fairness..."):
-        breakdown = term.compute_with_breakdown({}, {'pickup_dropoff_counts': data})
+        breakdown = term.compute_with_breakdown({}, auxiliary_data)
     
     # ==========================================================================
     # RESULTS DISPLAY
@@ -566,6 +711,29 @@ def main():
     # Tab 4: Statistics
     with tab4:
         st.subheader("Detailed Statistics")
+        
+        # Taxi count source info
+        if taxi_count_source == "active_taxis_lookup":
+            st.info(
+                f"🚕 **Using Active Taxis Lookup** - N^p varies by cell and period.\n\n"
+                f"Dataset: `{os.path.basename(active_taxis_path) if active_taxis_path else 'N/A'}`"
+            )
+            
+            if breakdown['statistics'].get('active_taxis_stats'):
+                at_stats = breakdown['statistics']['active_taxis_stats']
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Records", f"{at_stats.get('total_keys', 0):,}")
+                with col2:
+                    st.metric("Mean Active Taxis", f"{at_stats['count_stats']['mean']:.1f}")
+                with col3:
+                    st.metric("Max Active Taxis", f"{at_stats['count_stats']['max']}")
+                with col4:
+                    st.metric("Zero Count Cells", f"{at_stats['count_stats']['zero_count']:,}")
+        else:
+            st.info(f"🚕 **Using Constant Taxi Count** - N^p = {num_taxis} for all cells")
+        
+        st.divider()
         
         # Gini statistics
         col1, col2 = st.columns(2)

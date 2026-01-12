@@ -13,6 +13,13 @@ where:
     - G_a^p = Gini coefficient of Arrival Service Rates in period p
     - G_d^p = Gini coefficient of Departure Service Rates in period p
 
+Service Rate Formula:
+    DSR_s^p = pickups_s^p / (N_s^p × T)
+    
+where N_s^p can be:
+    - A constant (num_taxis) for all cells
+    - Dynamic per-cell values from active_taxis dataset
+
 Reference:
     Su et al. (2018) "Uncovering Spatial Inequality in Taxi Services"
 """
@@ -37,6 +44,9 @@ from spatial_fairness.utils import (
     compute_service_rates_for_period,
     validate_pickup_dropoff_data,
     get_data_statistics,
+    load_active_taxis_data,
+    get_active_taxis_statistics,
+    validate_active_taxis_period_alignment,
 )
 
 
@@ -121,8 +131,11 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
         
         data = auxiliary_data['pickup_dropoff_counts']
         
+        # Get active_taxis data if provided
+        active_taxis_data = auxiliary_data.get('active_taxis_counts', None)
+        
         # Compute and return
-        result = self._compute_from_counts(data)
+        result = self._compute_from_counts(data, active_taxis_data)
         return result['value']
     
     def compute_with_breakdown(
@@ -137,7 +150,9 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
         
         Args:
             trajectories: Dictionary of trajectories
-            auxiliary_data: Must contain 'pickup_dropoff_counts'
+            auxiliary_data: Must contain 'pickup_dropoff_counts'.
+                           Optionally can contain 'active_taxis_counts' for
+                           per-cell taxi counts when taxi_count_source='active_taxis_lookup'
             
         Returns:
             Dictionary with:
@@ -150,17 +165,21 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
             raise ValueError("auxiliary_data must contain 'pickup_dropoff_counts'")
         
         data = auxiliary_data['pickup_dropoff_counts']
-        return self._compute_from_counts(data)
+        active_taxis_data = auxiliary_data.get('active_taxis_counts', None)
+        
+        return self._compute_from_counts(data, active_taxis_data)
     
     def _compute_from_counts(
         self,
-        data: Dict[Tuple[int, int, int, int], Tuple[int, int]]
+        data: Dict[Tuple[int, int, int, int], Tuple[int, int]],
+        active_taxis_data: Optional[Dict[Tuple, int]] = None,
     ) -> Dict[str, Any]:
         """
         Core computation from pickup/dropoff counts.
         
         Args:
             data: Raw pickup_dropoff_counts data
+            active_taxis_data: Pre-loaded active_taxis data (optional)
             
         Returns:
             Complete breakdown including value and all intermediate results
@@ -174,6 +193,24 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
         
         # Get data statistics
         data_stats = get_data_statistics(data)
+        
+        # Handle active_taxis data loading if needed
+        active_taxis_stats = None
+        if self.config.taxi_count_source == "active_taxis_lookup":
+            if active_taxis_data is None and self.config.active_taxis_data_path:
+                # Load active_taxis data from path
+                active_taxis_data = load_active_taxis_data(self.config.active_taxis_data_path)
+                self._log(f"Loaded active_taxis data from {self.config.active_taxis_data_path}")
+            
+            if active_taxis_data is not None:
+                # Validate period alignment
+                is_aligned, alignment_msg = validate_active_taxis_period_alignment(
+                    active_taxis_data, self.config.period_type
+                )
+                if not is_aligned:
+                    self._log(f"Warning: {alignment_msg}")
+                
+                active_taxis_stats = get_active_taxis_statistics(active_taxis_data)
         
         # Aggregate by period
         pickups, dropoffs = aggregate_counts_by_period(
@@ -198,7 +235,7 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
                 period, self.config.period_type, self.config.num_days
             )
             
-            # Compute service rates
+            # Compute service rates (with optional active_taxis lookup)
             dsr_values, asr_values = compute_service_rates_for_period(
                 pickups=pickups,
                 dropoffs=dropoffs,
@@ -209,6 +246,9 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
                 include_zero_cells=self.config.include_zero_cells,
                 data_is_one_indexed=self.config.data_is_one_indexed,
                 min_activity_threshold=self.config.min_activity_threshold,
+                active_taxis_data=active_taxis_data if self.config.taxi_count_source == "active_taxis_lookup" else None,
+                active_taxis_fallback=self.config.active_taxis_fallback,
+                period_type=self.config.period_type,
             )
             
             # Compute Gini coefficients
@@ -270,13 +310,18 @@ class SpatialFairnessTerm(ObjectiveFunctionTerm):
                     'max': float(np.max(gini_departures)) if gini_departures else 0.0,
                 },
                 'data_stats': data_stats,
+                'active_taxis_stats': active_taxis_stats,
             },
             'diagnostics': {
                 'computation_time_ms': elapsed_ms,
                 'config': {
                     'period_type': self.config.period_type,
                     'grid_dims': self.config.grid_dims,
+                    'taxi_count_source': self.config.taxi_count_source,
                     'num_taxis': self.config.num_taxis,
+                    'active_taxis_data_path': self.config.active_taxis_data_path,
+                    'active_taxis_neighborhood': self.config.active_taxis_neighborhood,
+                    'active_taxis_fallback': self.config.active_taxis_fallback,
                     'num_days': self.config.num_days,
                     'include_zero_cells': self.config.include_zero_cells,
                 },

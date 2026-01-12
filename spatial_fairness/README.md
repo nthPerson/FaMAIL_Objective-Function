@@ -19,7 +19,7 @@ Where:
 
 $$G = 1 + \frac{1}{n} - \frac{2}{n^2 \mu} \sum_{i=1}^{n} (n - i + 1) \cdot x_{(i)}$$
 
-Where $x_{(i)}$ are values sorted in ascending order.
+Where $x_{(i)}$ are service rate values sorted in ascending order.
 
 ## Installation
 
